@@ -1,0 +1,140 @@
+name: Deploy College Assistant to AWS
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+jobs:
+
+  # ==========================================
+  # FRONTEND BUILD
+  # ==========================================
+  frontend:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build React application
+        run: npm run build
+
+      - name: Upload frontend build
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/dist
+
+
+  # ==========================================
+  # BACKEND CHECK
+  # ==========================================
+  backend:
+    name: Check Backend
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check Python syntax
+        run: |
+          python -m compileall app
+
+
+  # ==========================================
+  # DEPLOY FRONTEND TO AWS S3
+  # ==========================================
+  deploy-frontend:
+    name: Deploy Frontend to AWS S3
+    needs: frontend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download frontend build
+        uses: actions/download-artifact@v5
+        with:
+          name: frontend-build
+          path: frontend/dist
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload frontend to S3
+        run: |
+          aws s3 sync frontend/dist \
+            s3://${{ secrets.AWS_S3_BUCKET }} \
+            --delete
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.AWS_CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+
+  # ==========================================
+  # DEPLOY BACKEND TO AWS EC2
+  # ==========================================
+  deploy-backend:
+    name: Deploy Backend to AWS EC2
+    needs: backend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy backend through SSH
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd ~/college-assistant
+
+            git pull origin main
+
+            cd backend
+
+            source venv/bin/activate
+
+            pip install -r requirements.txt
+
+            sudo systemctl restart college-assistant
+
+            sudo systemctl status college-assistant --no-pager
