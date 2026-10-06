@@ -81,7 +81,6 @@ This is a working foundation/MVP. Before production, add:
 - refresh tokens and stronger authentication
 - password reset
 - file upload storage (S3/Cloudinary/local storage)
-- CSV/Excel bulk import
 - timetable management
 - lecture replacement management
 - 10-minute scheduled notifications
