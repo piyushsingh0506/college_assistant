@@ -83,9 +83,10 @@ jobs:
   # ==========================================
   # DEPLOY FRONTEND TO AWS S3
   # ==========================================
+  
   deploy-frontend:
-    name: Deploy Frontend to AWS S3
-    needs: frontend
+    name: Deploy Frontend to EC2
+    needs: [frontend, backend]
     runs-on: ubuntu-latest
 
     steps:
@@ -95,59 +96,38 @@ jobs:
           name: frontend-build
           path: frontend/dist/
 
-      - name: Validate AWS configuration
+      - name: Deploy frontend over SSH
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
         run: |
-          test -n "$AWS_ACCESS_KEY_ID" || {
-            echo "::error::AWS_ACCESS_KEY_ID secret is missing"
-            exit 1
-          }
+          set -eu
 
-          test -n "$AWS_SECRET_ACCESS_KEY" || {
-            echo "::error::AWS_SECRET_ACCESS_KEY secret is missing"
-            exit 1
-          }
+          test -n "$EC2_HOST"
+          test -n "$EC2_USERNAME"
+          test -n "$EC2_SSH_KEY"
 
-          test -n "$AWS_REGION" || {
-            echo "::error::AWS_REGION secret is missing"
-            exit 1
-          }
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/college-assistant.pem
+          chmod 600 ~/.ssh/college-assistant.pem
 
-          test -n "$AWS_S3_BUCKET" || {
-            echo "::error::AWS_S3_BUCKET secret is missing"
-            exit 1
-          }
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          ssh -i ~/.ssh/college-assistant.pem \
+            "$EC2_USERNAME@$EC2_HOST" \
+            'mkdir -p /tmp/college-assistant-dist'
 
-      - name: Verify AWS identity
-        run: aws sts get-caller-identity
+          scp -i ~/.ssh/college-assistant.pem -r frontend/dist/. \
+            "$EC2_USERNAME@$EC2_HOST:/tmp/college-assistant-dist/"
 
-      - name: Upload frontend to S3
-        env:
-          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
-        run: |
-          aws s3 sync frontend/dist/ "s3://${AWS_S3_BUCKET}/" --delete
-
-      # CloudFront invalidation is optional.
-      # If no distribution ID is configured, skip it.
-      - name: Invalidate CloudFront cache
-        env:
-          CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.AWS_CLOUDFRONT_DISTRIBUTION_ID }}
-        if: ${{ env.CLOUDFRONT_DISTRIBUTION_ID != '' }}
-        run: |
-          aws cloudfront create-invalidation \
-            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
-            --paths "/*"
+          ssh -i ~/.ssh/college-assistant.pem \
+            "$EC2_USERNAME@$EC2_HOST" \
+            'sudo mkdir -p /var/www/college-assistant &&
+             sudo rsync -a --delete /tmp/college-assistant-dist/ /var/www/college-assistant/ &&
+             sudo nginx -t &&
+             sudo systemctl reload nginx &&
+             rm -rf /tmp/college-assistant-dist'
 
   # ==========================================
   # DEPLOY BACKEND TO AWS EC2
