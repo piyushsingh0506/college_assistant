@@ -250,4 +250,4 @@ jobs:
             sudo systemctl is-active college-assistant
 
             echo "Backend deployment checks completed."
-```
+
