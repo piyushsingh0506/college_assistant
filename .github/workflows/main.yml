@@ -1,3 +1,4 @@
+```yaml
 name: Deploy College Assistant to AWS
 
 on:
@@ -6,6 +7,9 @@ on:
       - main
 
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
 
@@ -27,7 +31,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: "20"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -41,8 +45,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: frontend-build
-          path: frontend/dist
-
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 1
 
   # ==========================================
   # BACKEND CHECK
@@ -63,6 +68,8 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
 
       - name: Install dependencies
         run: |
@@ -71,8 +78,7 @@ jobs:
 
       - name: Check Python syntax
         run: |
-          python -m compileall app
-
+          python -m compileall -q app
 
   # ==========================================
   # DEPLOY FRONTEND TO AWS S3
@@ -87,7 +93,34 @@ jobs:
         uses: actions/download-artifact@v5
         with:
           name: frontend-build
-          path: frontend/dist
+          path: frontend/dist/
+
+      - name: Validate AWS configuration
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        run: |
+          test -n "$AWS_ACCESS_KEY_ID" || {
+            echo "::error::AWS_ACCESS_KEY_ID secret is missing"
+            exit 1
+          }
+
+          test -n "$AWS_SECRET_ACCESS_KEY" || {
+            echo "::error::AWS_SECRET_ACCESS_KEY secret is missing"
+            exit 1
+          }
+
+          test -n "$AWS_REGION" || {
+            echo "::error::AWS_REGION secret is missing"
+            exit 1
+          }
+
+          test -n "$AWS_S3_BUCKET" || {
+            echo "::error::AWS_S3_BUCKET secret is missing"
+            exit 1
+          }
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
@@ -96,18 +129,25 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Upload frontend to S3
-        run: |
-          aws s3 sync frontend/dist \
-            s3://${{ secrets.AWS_S3_BUCKET }} \
-            --delete
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
 
+      - name: Upload frontend to S3
+        env:
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        run: |
+          aws s3 sync frontend/dist/ "s3://${AWS_S3_BUCKET}/" --delete
+
+      # CloudFront invalidation is optional.
+      # If no distribution ID is configured, skip it.
       - name: Invalidate CloudFront cache
+        env:
+          CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.AWS_CLOUDFRONT_DISTRIBUTION_ID }}
+        if: ${{ env.CLOUDFRONT_DISTRIBUTION_ID != '' }}
         run: |
           aws cloudfront create-invalidation \
-            --distribution-id ${{ secrets.AWS_CLOUDFRONT_DISTRIBUTION_ID }} \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
             --paths "/*"
-
 
   # ==========================================
   # DEPLOY BACKEND TO AWS EC2
@@ -118,23 +158,96 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Validate EC2 configuration
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          test -n "$EC2_HOST" || {
+            echo "::error::EC2_HOST secret is missing"
+            exit 1
+          }
+
+          test -n "$EC2_USERNAME" || {
+            echo "::error::EC2_USERNAME secret is missing"
+            exit 1
+          }
+
+          test -n "$EC2_SSH_KEY" || {
+            echo "::error::EC2_SSH_KEY secret is missing"
+            exit 1
+          }
+
+          echo "EC2 configuration is present."
+
       - name: Deploy backend through SSH
         uses: appleboy/ssh-action@v1.2.2
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          command_timeout: 2m
           script: |
-            cd ~/college-assistant
+            set -eu
 
-            git pull origin main
+            echo "Connected to EC2"
+            hostname
 
-            cd backend
+            APP_DIR="/home/ubuntu/college_assistant"
 
-            source venv/bin/activate
+            if [ ! -d "$APP_DIR" ]; then
+              echo "ERROR: Application directory does not exist: $APP_DIR"
+              exit 1
+            fi
 
-            pip install -r requirements.txt
+            cd "$APP_DIR"
 
+            echo "Application directory:"
+            pwd
+
+            echo "Checking application files..."
+            ls -la
+
+            if [ ! -d "$APP_DIR/backend" ]; then
+              echo "ERROR: Backend source directory is missing."
+              echo "Restore the backend from GitHub before deploying."
+              exit 1
+            fi
+
+            if [ ! -f "$APP_DIR/backend/requirements.txt" ]; then
+              echo "ERROR: backend/requirements.txt is missing."
+              exit 1
+            fi
+
+            if [ ! -f "$APP_DIR/backend/app/main.py" ]; then
+              echo "ERROR: backend/app/main.py is missing."
+              exit 1
+            fi
+
+            echo "Backend source files are present."
+
+            if [ ! -x "$APP_DIR/backend/venv/bin/python" ]; then
+              echo "ERROR: Backend virtual environment is missing."
+              echo "Create and configure the backend venv before deployment."
+              exit 1
+            fi
+
+            if ! sudo systemctl cat college-assistant >/dev/null 2>&1; then
+              echo "ERROR: college-assistant systemd service is not configured."
+              echo "Configure the service before enabling automatic restarts."
+              exit 1
+            fi
+
+            echo "Installing backend dependencies..."
+            "$APP_DIR/backend/venv/bin/python" -m pip install \
+              -r "$APP_DIR/backend/requirements.txt"
+
+            echo "Restarting backend service..."
             sudo systemctl restart college-assistant
 
-            sudo systemctl status college-assistant --no-pager
+            echo "Checking backend service..."
+            sudo systemctl is-active college-assistant
+
+            echo "Backend deployment checks completed."
+```
